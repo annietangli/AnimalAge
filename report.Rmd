@@ -1,0 +1,1651 @@
+---
+title: "Animal max-longevity project report"
+author: "Tang Li"
+date: "`r format(Sys.Date(), '%b %d, %Y')`"
+output:
+  pdf_document:
+    latex_engine: lualatex
+    toc: TRUE
+    df_print: kable
+    extra_dependencies: xcolor
+mainfont: open-sans
+monofont: inconsolata
+linkcolor: violet
+urlcolor: violet
+toccolor: violet
+---
+
+```{r setup, include=FALSE, purl=FALSE}
+# Download rmakrdown libraries
+if (!require(rmarkdown)) {
+  install.packages("rmarkdown", repos = "http://cran.us.r-project.org")
+}
+if (!require(markdown)) {
+  install.packages("markdown", repos = "http://cran.us.r-project.org")
+}
+if (!require(mime)) {
+  install.packages("mime", repos = "http://cran.us.r-project.org")
+}
+
+if (!require(knitr)) {
+  install.packages("knitr", repos = "http://cran.us.r-project.org")
+}
+library(knitr)
+
+opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+```{r library, include=FALSE}
+# Download core libraries
+if (!require(tidyverse)) {
+  install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+}
+if (!require(caret)) {
+  install.packages("caret", repos = "http://cran.us.r-project.org")
+}
+
+library(tidyverse)
+library(caret)
+options(digits = 3)
+```
+
+```{r fonts, include=FALSE, purl=FALSE}
+# Download fonts
+if (!require(gfonts)) {
+  install.packages("gfonts", repos = "http://cran.us.r-project.org")
+}
+library(gfonts)
+
+if (!dir.exists("fonts")) {
+  dir.create("fonts")
+}
+
+download_font(
+id = "open-sans",
+output_dir = "fonts",
+variants = c("regular", "italic", "bold")
+)
+download_font(
+id = "inconsolata",
+output_dir = "fonts",
+variants = c("regular", "italic", "bold")
+)
+```
+
+--------------------------------------------------------------------------------
+
+***Note: All the links are colored in*** \textcolor{violet}{violet} ***(without
+underline), feel free to click and navigate around the pdf!***
+
+# Introduction
+
+## About this project
+
+In this machine learning project, I'll solve a regression problem of predicting
+animal max-longevity, which is the *recorded* highest lifespan for each species
+(e.g. Bowhead whale: 211 years). Since this is a regression problem, the goal is
+to achieve a low rmse (root mean squared error). The requirement is to develop
+at least 2 models with 1 model more advanced than linear regression.
+
+My approach is to create ensembles: combining results of different methods into
+one that hopefully improves the result. I developed two ensemble models. The
+first ensemble is linear, combining cubist and lm. The second ensemble is
+non-linear, combining rf and rpart. The results of both ensembles are similar:
+linear achieved a rmse of 8.31 years, and non-linear achieved a rmse of 8.91
+years. I think my results are good considering animals max-longevity could range
+from about 2 to 200 years.
+
+## Dataset
+
+```{r download-data, include=FALSE}
+# Download age tsv
+dl <- tempfile()
+download.file("https://genomics.senescence.info/species/dataset.zip", dl)
+
+age <- read_tsv(unzip(dl, "anage_data.txt"))
+
+summary_age <-
+  sapply(age[, c(10:21, 26:30)], function(x)
+    summary(x))
+summary_age <- as_tibble(t(summary_age), rownames = "Var")
+save(summary_age, file = "summary_age.rda")
+
+rm(dl, summary_age)
+unlink("anage_data.txt")
+```
+
+I picked the curated animal max-longevity dataset from
+[AnAge](https://genomics.senescence.info/species/index.html), and from here on
+we'll call it the **age** dataset. AnAge recorded many species max-longevity and
+their features. The age dataset has `r nrow(age)` rows and `r ncol(age)`
+columns. Each row represents a species, and each column is a feature.
+
+Due to some rows and columns have large number of NAs, I'll clean the dataset,
+**only using a subset of the data**. The cleaned dataset has 996 rows and 7
+columns. All details about original dataset and data cleaning is in the Methods
+[data cleaning](#data-cleaning) section. Here we show the final list of
+variables in the cleaned dataset, and preview 1 row to better visualize.
+
+```{r sample-row}
+# Because we haven't cleaned and format dataset yet, I'm temporarily
+# showing Mammal instead of Mammalia from original dataset
+# just to simulate the final format
+age %>%
+  filter(`Common name` == "Bowhead whale") %>%
+  select(
+    Class,
+    `Common name`,
+    `Maximum longevity (yrs)`,
+    `Adult weight (g)`,
+    `Female maturity (days)`,
+    `Gestation/Incubation (days)`,
+    `Litter/Clutch size`
+  ) %>%
+  mutate(Class = "Mammal")
+```
+
+**info**
+
+| Variable    | Description                                  |
+|-------------|----------------------------------------------|
+| Class       | taxonomy class, bird or mammal               |
+| Common name | name we are familiar with, e.g. Golden eagle |
+
+**outcome** (usually in a list, referred to as `y`)
+
+| Variable                | Description                                      |
+|-------------------------|--------------------------------------------------|
+| Maximum longevity (yrs) | the *recorded* highest lifespan for each species |
+
+*Note: emphasis on recorded because animals could live above its species
+max-longevity, but its age is just not recorded in dataset yet*
+
+**predictors** (usually in a matrix, referred to as `x`)
+
++------------------------------+-----------------------------------------------+
+| Variable                     | Description                                   |
++==============================+===============================================+
+| Adult weight (g)             | adult weight in grams                         |
++------------------------------+-----------------------------------------------+
+| Female maturity (days)       | female age of sexual maturity                 |
++------------------------------+-----------------------------------------------+
+| Gestation/Incubation (days)  | pregnancy time                                |
+|                              |                                               |
+|                              | mammals gestate litters, birds incubate eggs  |
++------------------------------+-----------------------------------------------+
+| Litter/Clutch size           | number of young (litters or eggs) in 1 birth  |
++------------------------------+-----------------------------------------------+
+
+## Key steps
+
+The objective is to develop the 2 final ensemble models, and see how well the
+final rmses are. A model is characterized by its tuning parameters and training
+data. During tuning stage we find parameters that minimize rmse. During training
+stage we specify which training data to use, and the more data the better.
+
+1.  Data cleaning
+
+    -   find good predictors and ensure our data has no missing data (NAs)
+
+2.  Data splitting
+
+    -   split our data into 3 sets: training, test and validation
+    -   training set (available): tuning and training
+    -   test set (available): evaluate intermediate models
+    -   validation set (hold out): evaluate final 2 models
+
+3.  Model development
+
+    -   Tune and train with different methods using training set
+    -   Combine methods and create 2 ensembles, 1 linear and 1 non-linear
+    -   Evaluate all methods using test set
+
+4.  Final test
+
+    -   Since more data is better, put train and test sets back together to form
+        the available set
+    -   Train the 2 final ensembles using available set
+    -   Evaluate 2 final ensembles using validation set
+
+# Methods
+
+## Data cleaning {#data-cleaning}
+
+> The original `r ncol(age)` variables specification is in appendix [original
+> dataset](#original-dataset) section. There I describe what each variable
+> represents, show the 5-number summary and number of NAs.
+
+To use the caret package, **my cleaned dataset must have no NAs** because
+otherwise the train function would fail. A not-so-good alternative is to let
+caret omit the rows with NAs on required variables, but I won't know which rows
+have been omitted when computing rmse.
+
+### Which rows to pick
+
+Even though AnAge included many classes of animals, I'll only analyze **birds
+and mammals**, due to other animals classes (amphibian, reptile, fish) have too
+many NAs in their features. Also I've kept only rows that meet quality standard.
+To summarize:
+
+-   Class: keep bird and mammal (renamed from Aves, Mammalia), remove all other
+    classes
+
+-   Specimen origin: keep captivity and wild animals, remove ones with unknown
+    origin
+
+-   Sample size: keep sample size $n \ge 10$ (small, medium, huge categories),
+    remove rows with $n < 10$ (tiny category)
+
+-   Data quality: keep rows that have acceptable and high confidence of
+    max-longevity, remove rows with low or questionable confidence
+
+```{r clean-row, include=FALSE}
+age <- age %>%
+  filter(
+    Class %in% c("Aves", "Mammalia") &
+    `Specimen origin` %in% c("captivity", "wild") &
+    `Sample size` != "tiny" &
+    `Data quality` %in% c("acceptable", "high")
+  ) %>%
+  mutate( # renaming
+    Class = factor(
+      Class,
+      levels = c("Aves", "Mammalia"),
+      labels = c("Bird", "Mammal")
+    ))
+```
+
+### Which predictors to pick
+
+Now our cleaned set only has rows of birds and mammals, but it's still not NA
+free. The final cleaned dataset must have no NAs. The challenge is that our two
+goals conflict each other:
+
+1.  Goal: Keep as many predictors as possible, since more predictors generally
+    yield better result
+
+2.  Goal: Keep as many rows as possible, since more training data also yield
+    better result
+
+3.  Conflict: the more predictors we **require** (i.e. a row must have no
+    missing data for any predictor column), the less rows we have for training
+    data
+
+Step 1 is to decide on a set of candidate predictors that guarantee enough
+animals for training. Step 2 is to assess the candidate predictors for
+correlation. Finally we filter rows that have no NAs for the required
+predictors.
+
+#### Step 1: find candidates
+
+```{r clean-col-step1, include=FALSE}
+age <- age %>%
+  filter(
+    # outcome definitely can't be NA
+    !is.na(`Maximum longevity (yrs)`)
+  ) %>%
+  select(
+    Class,
+    `Common name`,
+    `Maximum longevity (yrs)`,
+    `Adult weight (g)`,
+    `Female maturity (days)`,
+    `Male maturity (days)`,
+    `Gestation/Incubation (days)`,
+    `Litter/Clutch size`
+  )
+```
+
+At this stage we don't require rows to have no NAs, since if a candidate is
+dropped at the end, we would have required more than we need, which leads to
+fewer rows left.
+
+I decided to *initially* include these 5 life history predictors that guarantee
+enough animals and good result:
+
+-   **Adult weight (g)**: A heavy weight/larger body size could protect animal
+    from predators, may have greater chance to survive and might increase
+    longevity.
+
+-   **Female maturity (days), Male maturity (days)**: If an animal lives long,
+    then it might not need to reach (sexual) maturity soon and its pre-adulthood
+    is longer, and vice versa.
+
+-   **Gestation/Incubation (days)**: Just like maturity, an animal's pregnancy
+    duration might also be a biological indicator to its longevity. Birds often
+    take less time to incubate eggs than mammals gestate litters.
+
+-   **Litter/Clutch size**: Animal produce more litters/eggs if not all young
+    can survive. Less chance to survive might cause shorter longevity.
+
+#### Step 2: assess candidates
+
+Caret is a powerful machine learning library which we will use through out this
+project. The first tip from caret is to **eliminate predictors with near-zero
+variance**, because otherwise models may crash. The table below shows `nzv`
+column has all FALSE, which means that none of our predictors have near-zero
+variance.
+
+```{r clean-col-step2-nzv}
+# Remove index 1:3 because predictors start at col 4
+nearZeroVar(age[, -(1:3)], saveMetrics = TRUE)
+```
+
+The second tip is to **remove highly correlated predictors** to improve model
+performance, and I set the correlation cutoff to be $\le$ 0.75. We can visualize
+the correlation matrix in a plot (*variable names are abbreviated to save
+space*). Male maturity (mmat) is highly correlated with female maturity (fmat)
+with correlation = 0.94. In this case, caret removes the variable with the
+largest mean absolute correlation out of the pair, and outputs male maturity.
+
+```{r clean-col-step2-cor}
+if (!require(corrplot)) {
+  install.packages("corrplot", repos = "http://cran.us.r-project.org")
+}
+library(corrplot)
+
+# The correlation matrix
+cor_matrix <- cor(
+  age[, -(1:3)], 
+  use = "complete.obs" # Ignores cells with NAs for now
+  )
+
+# Temp shorten variable names for the plot
+dimnames(cor_matrix) <- list(
+  c("wt", "fmat", "mmat", "ges", "lit"),
+  c("wt", "fmat", "mmat", "ges", "lit")
+)
+
+# Correlation plot has cor coefficients, and do some pretty styling
+corrplot(
+  cor_matrix, method = "shade", shade.col = NA,
+  cl.pos = "n", tl.col = "black", tl.srt = 45, diag = FALSE,
+  addCoef.col = "white", col = COL2(diverging = "PiYG", n = 2))
+
+dimnames(cor_matrix) <- list( # rename variables back
+  names(age[,-(1:3)]),
+  names(age[,-(1:3)])
+)
+
+highly_cor_vars <- findCorrelation(cor_matrix, cutoff = .75, names = TRUE, verbose = TRUE)
+highly_cor_vars
+```
+
+#### Step 3: final dataset
+
+```{r clean-col-step3, include=FALSE}
+# we require each row to not have any NA for the 4 final predictors
+age <- age %>%
+  select(-all_of(highly_cor_vars)) %>%
+  filter(
+    !is.na(`Adult weight (g)`),
+    !is.na(`Female maturity (days)`),
+    !is.na(`Gestation/Incubation (days)`),
+    !is.na(`Litter/Clutch size`)
+  ) %>%
+  mutate( # Make these 2 in correct integer type, from double
+    `Female maturity (days)` =
+      as.integer(`Female maturity (days)`),
+    `Gestation/Incubation (days)` =
+      as.integer(`Gestation/Incubation (days)`),
+  )
+
+rm(cor_matrix, highly_cor_vars)
+```
+
+The final predictors left are **Adult weight (g), Female maturity (days),
+Gestation/Incubation (days), and Litter/Clutch size**. We filter rows with data
+for all 4 predictors. The final age dataset has `r nrow(age)` rows and
+`r ncol(age)` columns. The table below shows how many birds and mammals we have.
+
+```{r class-summary}
+age %>%
+  group_by(Class) %>%
+  count()
+```
+
+## Data splitting
+
+```{r split-data, include=FALSE}
+set.seed(1)
+training_index <-
+  createDataPartition(
+    age$`Maximum longevity (yrs)`,
+    times = 1,
+    p = 0.8,
+    list = FALSE
+  )
+
+available_set <- age[training_index, ]
+validation_set <- age[-training_index, ]
+
+# train: 80%*80%=64% original, test: 20%*80%=16%
+set.seed(1)
+training_index <- 
+  createDataPartition(
+    available_set$`Maximum longevity (yrs)`,
+    times = 1,
+    p = 0.8,
+    list = FALSE
+  )
+
+train_set <- available_set[training_index, ]
+test_set <- available_set[-training_index, ]
+
+rm(training_index, age, available_set)
+```
+
+The age dataset is split into 3 sets: training set, test set, and validation
+set. First we split age into available set (80%) and validation set (20%). Then
+we split available set into training (80%) set and test set (20%). Training set
+is used to develop models, and test set is used to evaluate model performance.
+Validation set is only used to evaluate the final 2 models. Both splits are
+80%-20%, because our age dataset is small (only \~1000 rows) I want to leave
+plenty of validation data. We have `r nrow(train_set)` rows for training set,
+`r nrow(test_set)` rows for test set, and `r nrow(validation_set)` rows for
+validation set.
+
+## Data visualization
+
+We'll use training set to visualize our data. The first set of plots give us
+some background information on birds and mammals. The second set of plots
+explores relationship of each predictor and max-longevity, which will give us
+insight on potential methods to choose.
+
+### Background
+
+**Max-longevity**: The boxplot and 5-number summary below compares the
+max-longevity between birds and mammals. Birds have lower median and smaller
+range compared to mammals. Mammals also have many outliers on the higher end.
+
+```{r summary-longevity}
+quantile(train_set$`Maximum longevity (yrs)`, c(0, 0.25, 0.5, 0.75, 1))
+```
+
+```{r plot-longevity}
+train_set %>%
+  ggplot(aes(Class, `Maximum longevity (yrs)`, fill = Class)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Pastel1") +
+  guides(fill = "none") + # no fill legend
+  ggtitle("Max-longevity")
+```
+
+Let's inspect birds and mammals with longest and shortest lifespan. We can see
+that long living species are **heavier, mature later, and gave birth to less
+young**. In contrast, shorter lifespan species are **lighter, mature earlier,
+and gave birth to more young**.
+
+```{r min-max-longevity}
+# Longest lifespan animals in each class, slice max
+train_set %>%
+  group_by(Class) %>%
+  slice_max(order_by = `Maximum longevity (yrs)`, n = 1, with_ties = FALSE)
+
+# Shortest lifespan animals in each class, slice min
+train_set %>%
+  group_by(Class) %>%
+  slice_min(order_by = `Maximum longevity (yrs)`, n = 1, with_ties = FALSE)
+```
+
+**Adult weight**: Here's a density plot showing the distribution of adult weight
+of birds and mammals. Overall birds are lighter than mammals. Birds density
+curve show two peaks around 25 g and 500 g. Mammals show a small bump around 50
+g and a large peak around 7000 g (7 kg).
+
+```{r plot-wt}
+train_set %>%
+  ggplot(aes(`Adult weight (g)`, fill = Class)) +
+  geom_density(position = "identity", alpha = 0.5) +
+  geom_vline( # dotted lines to highlight where density peaks are
+    xintercept = c(25, 500, 7000), alpha = 0.5, linetype = 2
+    ) +
+  scale_x_log10() +
+  annotation_logticks(sides = "b") + # a log ruler on bottom
+  scale_fill_brewer(palette = "Set1") +
+  ggtitle("Adult weight")
+```
+
+**Female maturity vs. pregnancy time and num of young**: We an see distinct 2
+groups of points corresponds to birds and mammals. As we increase pregnancy
+time, the less number of young are produced. Birds generally have shorter
+pregnancy duration than mammals. With the same pregnancy time, birds mature
+later than mammals.
+
+```{r plot-mat-ges-lit}
+train_set %>%
+  ggplot(
+    aes(
+      `Gestation/Incubation (days)`,
+      `Female maturity (days)`
+    )
+  ) +
+  geom_point(aes(color = Class, size = `Litter/Clutch size`)) +
+  scale_x_log10() +
+  scale_y_log10() +
+  annotation_logticks() +
+  scale_color_brewer(palette = "Set1") +
+    labs(size = paste( # breaks name from 1 line to 2 lines
+      str_wrap("Litter/Clutch size", width = 5), 
+      collapse = "\n")) +
+  ggtitle("Female maturity vs. pregnancy time and num of young")
+```
+
+### Predictors and outcome
+
+**Max-longevity vs. pregnancy time and num of young**: This scatter plot shows
+relationships between max-longevity and two variables: positive relationship for
+pregnancy time, and negative relationship for number of young. The gold lm line
+runs nicely through the points, so linear equations are reliable. The density
+contours show 3 dense areas, and points group themselves into clusters. This
+suggests that non-linear methods' grouping techniques could work as well.
+
+| Dense area | (pregnancy time, max-longevity) |
+|------------|---------------------------------|
+| Bird       | (15 days, 10 years)             |
+| Bird       | (25 days, 20 years)             |
+| Mammal     | (200 days, 25 years)            |
+
+```{r plot-longevity-ges-lit}
+train_set %>%
+  ggplot(aes(`Gestation/Incubation (days)`, `Maximum longevity (yrs)`)) +
+  geom_point(aes(color = Class, size = `Litter/Clutch size`)) +
+  geom_smooth(method = "lm", color = "gold") +
+  geom_density_2d(color = "lavender", alpha = 0.5, size = 0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  annotation_logticks(color = "white") +
+  scale_color_brewer(palette = "Pastel1") +
+    # Can't see dark dots on dark theme, change to light color
+  guides(size = guide_legend(override.aes = list(color = "lavender"))) +
+  labs(size = paste(
+      str_wrap("Litter/Clutch size", width = 5), 
+      collapse = "\n")) +
+  theme_dark() +
+  ggtitle("Max-longevity vs. pregnancy time and num of young")
+```
+
+**Max-longevity vs. adult weight and female maturity**: This scatter plot shows
+that max-longevity has positive relationship with both adult weight and female
+maturity. Similar to last plot, the gold lm line shows a good fit so linear
+methods are suitable. The density contours show 2 dense areas, and points are
+tightly packed. Thus non-linear methods could be useful too.
+
+```{r plot-longevity-mat-wt}
+train_set %>%
+    # log to distinguish colors apart, can see easily
+  ggplot(aes(`Adult weight (g)`, `Maximum longevity (yrs)`,
+             color = log10(`Female maturity (days)`))) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "gold") +
+  geom_density_2d(color = "lemonchiffon", alpha = 0.5, size = 0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  annotation_logticks(color = "white") +
+  scale_color_distiller(palette = "YlGnBu") +
+  labs(
+    color = paste(
+      str_wrap("log of Female maturity (days)", width = 5), 
+      collapse = "\n")
+    ) +
+  theme_dark() +
+  ggtitle("Max-longevity vs. adult weight and female maturity")
+```
+
+## Model development
+
+To stick with caret's conventions, I format the datasets as follows:
+
+-   the 4 predictor columns form the **predictor matrix** $x$
+-   the max-longevity column forms the **outcome list** $y$
+
+```{r caret-format, include=FALSE}
+convert_matrix <- function(data) {
+  as.matrix(
+    data,
+    dimnames = list(
+      NULL, 
+      c(`Adult weight (g)`, `Female maturity (days)`,
+      `Gestation/Incubation (days)`, `Litter/Clutch size`)))
+}
+
+train_set <- train_set %>%
+  rename(y = `Maximum longevity (yrs)`) %>%
+  mutate(x = convert_matrix(train_set[, -(1:3)])) %>%
+  select(x, y, Class, `Common name`)
+  
+test_set <- test_set %>%
+  rename(y = `Maximum longevity (yrs)`) %>%
+  mutate(x = convert_matrix(test_set[, -(1:3)])) %>%
+  select(x, y, Class, `Common name`)
+
+validation_set <- validation_set %>%
+  rename(y = `Maximum longevity (yrs)`) %>%
+  mutate(x = convert_matrix(validation_set[, -(1:3)])) %>%
+  select(x, y, Class, `Common name`)
+
+rm(convert_matrix)
+```
+
+Caret also supports parallel computation to increase speed, which I have set up
+using doParallel library (see Rmd file).
+
+```{r parallel, include=FALSE}
+if (!require(doParallel)) {
+  install.packages("doParallel", repos = "http://cran.us.r-project.org")
+}
+library(doParallel)
+
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl)
+```
+
+### Caret functions
+
+Here is a brief introduction about model development using caret, and we will
+walk through again later when we train our first model. There are two key caret
+functions we will use: `train` and `predict`.
+
+**train**
+
+-   Purpose: Even with the same method, we can change its behavior by supplying
+    different values to tuning parameter(s). The objective is to find the best
+    tuning combo that has the min rmse.
+
+-   Input:
+
+    -   training data: predictor matrix $x$ and outcome $y$
+
+    -   tuning grid: supply each tuning parameter with a list of values to test,
+        cross join generates all tuning combos
+
+        -   e.g. committees = 1 and 2, neighbors = 3 and 4
+        -   cross join (committees, neighbors) = (1, 3), (1, 4), (2, 3), (2, 4)
+
+    -   method: the method we want to use (e.g. cubist)
+
+-   Output:
+
+    -   result: the tuning result, all combos with their *training* rmse
+        (*training* because it's computed from training set)
+    -   best tuning combo: the combo with the min *training* rmse (e.g.
+        committees = 2, neighbors = 4, training rmse = 7.5)
+    -   model: the model developed using best tuning combo
+
+**predict**
+
+-   Purpose: predict outcomes on test data
+
+-   Input:
+
+    -   test data: predictor matrix $x$
+    -   model: the model from train function
+
+-   Output:
+
+    -   predicted outcomes $\hat y$
+
+Once we have predicted outcomes $\hat y$, we can compute *test* rmse by
+comparing with true outcomes $y$. The test rmse is important because it shows
+how well model works with new data. On contrary, the *training* rmse is not as
+important, because it is computed with samples from training set (also same data
+to train the model). Hence training rmse is usually lower compared test rmse.
+
+### Linear models
+
+```{r download-linear, include=FALSE}
+# Download linear methods libraries
+if (!require(Cubist)) {
+  install.packages("Cubist", repos = "http://cran.us.r-project.org")
+}
+library(Cubist)
+```
+
+All linear methods generate linear equations. In our case, we have 4 predictors
+and each predictor $x_i$ is multiplied with a coefficient $c_i$ plus an
+intercept $b$ at the very end, and $\hat y$ would be our predicted
+max-longevity.
+
+$$
+\hat y = c_1 \cdot x_1 + c_2 \cdot x_2 + c_3 \cdot x_3 + c_4 \cdot x_4 + b
+$$
+
+There are 2 linear methods we want to test: **cubist and lm**.
+
+#### Cubist {#cubist}
+
+Instead of producing 1 model containing 1 linear equation, Cubist can generate
+many linear models containing many equations. For each model, there are rules
+that determine which equation to use.
+
+> For example, a model might look like: *if* weight \> 200 *then* use equation
+> 1, *if* (some other condition) *then* use equation 2, etc.
+
+Cubist will obtain a list of predictions from each model, and uses an internal
+function accounting all models to produce the final $\hat y$ list.
+
+Cubist has two tuning parameters: $committees$ (number of models) and
+$neighbors$ (for adjusting equations). Let's walk through caret's algorithm use
+cubist as an example. Once we understand how caret works, we won't need much
+explanations or show code for subsequent models.
+
+```{r cubist-train, echo=TRUE}
+set.seed(1)
+fit <- train(
+  x = train_set$x,
+  y = train_set$y,
+  method = "cubist",
+  tuneGrid = expand.grid(
+    committees = seq(1, 9, 2), 
+    neighbors = seq(5, 9, 1)
+    )
+)
+```
+
+| Tuning param | Values       | Values expanded |
+|--------------|--------------|-----------------|
+| committees   | seq(1, 9, 2) | 1, 3, 5, 7, 9   |
+| neighbors    | seq(5, 9, 1) | 5, 6, 7, 8, 9   |
+
+> **For each tuning combo** (runs $5 \cdot 5 = 25$ iterations)
+>
+> -   Bootstrap is caret's default resampling method. Our training data is
+>     sampled with replacement to generate 25 C-train and C-test sets. (*The C
+>     prefix avoids the naming conflict with our datasets.*)
+>
+> -   **For each pair of C-train and C-test** (runs 25 iterations)
+>
+>     -   Caret fits model with C-train, and evaluates rmse with C-test.
+>
+> -   Evaluate *training* rmse = the average of the 25 rmses for this tuning
+>     combo
+>
+> Select the tuning combo with the min *training* rmse
+
+Here is the best tuning combo (ignore the row number on the left), and the
+tuning result plot.
+
+```{r cubist-plot}
+# Save the best tuning combo for later use
+fit$bestTune
+best_tunes <- list(cubist = fit$bestTune)
+
+# Plot the full tuning result, training rmses of all combos
+ggplot(fit, highlight = TRUE) +
+  scale_x_continuous(breaks = seq(1, 9, 2)) +
+  ggtitle("Tuning result cubist")
+```
+
+Then we predict max-longevity using predict function and evaluate test rmse.
+
+```{r cubist-predict}
+# Predict test set outcomes, save the list of y_hat
+set.seed(1)
+linear_models <- tibble(
+  cubist = predict(fit, test_set$x)
+  )
+
+# Calculate rmse, save it to compare with other methods later
+rmses_linear <- tibble(
+  method = "cubist",
+  rmse = RMSE(linear_models$cubist, test_set$y)
+  )
+rmses_linear
+
+rm(fit)
+```
+
+#### lm {#lm}
+
+Lm is a simple method but its performance is usually really good. There are no
+tuning parameters for lm. We can see the coefficients for each predictor. The
+rmse is a bit better than cubist.
+
+```{r lm}
+set.seed(1)
+fit <- train(
+  x = train_set$x,
+  y = train_set$y,
+  method = "lm"
+)
+
+set.seed(1)
+linear_models <- linear_models %>% mutate(
+  lm = predict(fit, test_set$x)
+  )
+
+fit$finalModel$coefficients
+
+rmses_linear <- rmses_linear %>% add_row(
+  method = "lm",
+  rmse = RMSE(linear_models$lm, test_set$y)
+  )
+rmses_linear
+
+rm(fit)
+```
+
+#### Ensemble
+
+To create an ensemble we can take the mean of predicted $\hat y$ from our 2
+methods, cubist and lm. The ensemble's rmse is better than both our models.
+
+```{r linear-ensemble}
+linear_models <- linear_models %>%
+  rowwise() %>% # take one row at a time
+  mutate(
+    ensemble = mean(c(cubist, lm)) # take the mean
+    ) %>%
+  ungroup() # put rows back together
+
+rmses_linear <- rmses_linear %>% add_row(
+  method = "ensemble",
+  rmse = RMSE(linear_models$ensemble, test_set$y)
+)
+
+# Rank methods based on performance
+rmses_linear <- rmses_linear %>% arrange(rmse)
+rmses_linear
+```
+
+Here's a residual plot showing predicted vs. true max-longevity. The residual
+$r$ is the difference between true $y$ and predicted $\hat y$ outcome. We want
+our residuals to be as close to 0 as possible.
+
+$$
+r = y - \hat y
+$$
+
+There are 3 cases:
+
+1.  $r = 0$ means a perfect prediction. The point would be on the center line.
+2.  $r > 0$ means an *under*estimate. The point would be above the line.
+3.  $r < 0$ means an *over*estimate. The point would be below the line.
+
+The 2d plot shows how dense the points are in a contoured area. The lighter the
+color, the more dense. The ensemble takes an averaged shape of cubist and lm.
+The super dense regions of all 3 methods are centered on the line. The plot
+shows that the residuals are usually within 10 years.
+
+```{r linear-plot}
+linear_models %>%
+  transmute( # transmute is mutate + only select the specified columns
+    true = test_set$y,
+    r_cubist = true - cubist,
+    r_lm = true - lm,
+    r_ensemble = true - ensemble
+  ) %>%
+  pivot_longer( # create method and residual column, and spreads the data
+    cols = -true,
+    names_to = "method",
+    names_pattern = "r_(.*)", # remove the r_ prefix from r_cubist, etc.
+    values_to = "residual"
+    ) %>%
+  # Neat trick is to use rmses_linear$method which we ranked already
+  mutate(method = factor(
+    method,
+    levels = rmses_linear$method, 
+    ordered = TRUE
+    )) %>%
+  ggplot(aes(true, residual)) +
+  # ndensity to give each subplot a total density of 1, which is correct
+  # otherwise the entire plot has a total density of 1, which is wrong
+  geom_density_2d_filled(contour_var = "ndensity") +
+  geom_hline(yintercept = 0, size = 1, alpha = 0.75, color = "white") +
+  geom_point(color = "white", alpha = 0.25) +
+  scale_x_log10() +
+  annotation_logticks(sides = "b") +
+  theme_dark() +
+  ggtitle("Linear models residuals") +
+  facet_wrap(method~.)
+```
+
+We ordered the residuals to get the top 3 mistakes made by the ensemble. The top
+mistakes are underestimates (since $r > 0$) , and all 3 residuals are around 20
+years.
+
+```{r linear-mistakes}
+test_set %>%
+  mutate(
+    residual = y - linear_models$ensemble
+  ) %>%
+  select(Class, `Common name`, y, residual) %>%
+  slice_max(order_by = abs(residual), n = 3)
+
+rm(linear_models, rmses_linear)
+```
+
+### Non-linear
+
+```{r download-nonlinear, include=FALSE}
+# Download non-linear methods libraries
+if (!require(randomForest)) {
+  install.packages("randomForest", repos = "http://cran.us.r-project.org")
+}
+if (!require(rpart)) {
+  install.packages("rpart", repos = "http://cran.us.r-project.org")
+}
+if (!require(ggdendro)) {
+  install.packages("ggdendro", repos = "http://cran.us.r-project.org")
+}
+library(randomForest)
+library(rpart)
+library(ggdendro) # used to plot a decision tree
+```
+
+We will look at rf and rpart which are popular non-linear methods. Both methods
+are tree based.
+
+#### rpart {#rpart}
+
+Rpart stands for *recursive partitioning*, and it generates a binary decision
+tree. Each node is a split on a variable that improves the result the most, and
+rpart recursively partitions to create nodes. Finally the partitioning stops,
+and leaf nodes are predicted outcomes $\hat y$.
+
+> For example, a split might look like $maturity < 800$. Data fall into either
+> *yes* or *no* branch, then splitting continues.
+
+Rpart stop partitioning when can't improve result by $cp$ amount, and $cp$ is a
+tuning parameter.
+
+| Tuning param | Values               | Values expanded                       |
+|--------------|----------------------|---------------------------------------|
+| cp           | seq(0.01, 0.1, 0.01) | 10 values: 0.01, 0.02, 0.03, ..., 0.1 |
+
+Here is the best $cp$.
+
+```{r rpart-train}
+set.seed(1)
+fit <- train(
+  x = train_set$x,
+  y = train_set$y,
+  method = "rpart",
+  tuneGrid = data.frame(cp = seq(0.01, 0.1, 0.01))
+)
+
+fit$bestTune
+
+best_tunes <- c(best_tunes, list(rpart = fit$bestTune))
+
+ggplot(fit, highlight = TRUE) +
+  scale_x_continuous(breaks = seq(0.02, 0.1, 0.02)) +
+  labs(title = "Tuning result rpart")
+
+set.seed(1)
+nonlinear_models <- tibble(
+  rpart = predict(fit, test_set$x)
+  )
+
+rmses_nonlinear <- tibble(
+  method = "rpart",
+  rmse = RMSE(nonlinear_models$rpart, test_set$y)
+  )
+rmses_nonlinear
+```
+
+The rmse of rpart is higher than linear models. To see why, let's look the
+decision tree. It's interesting that there are only a few groups, and all
+predicted years are in multiples of 10.
+
+```{r rpart-plot}
+data <- dendro_data(fit$finalModel)
+# shorten variable names, otherwise plot won't fit
+data$labels$label <- str_replace_all(data$labels$label, "Fem.*\\)", "mat ")
+data$labels$label <- str_replace_all(data$labels$label, "Adult.*\\)", "wt ")
+data$labels$label <- str_replace_all(data$labels$label, "Ges.*\\)", "ges ")
+data$labels$label <- str_replace_all(data$labels$label, "Lit.*\\)", "lit ")
+data$leaf_labels$label <- as.numeric(data$leaf_labels$label) # correct the type
+
+ggplot() + 
+  geom_segment( # draw branches
+    data = segment(data), 
+    aes(x = x, y = y, xend = xend, yend = yend), alpha = 0.5
+    ) +
+  geom_label( # draw nodes: splits on predictor
+    data = label(data), 
+    aes(x = x, y = y, label = label), fill = "lightskyblue"
+    ) +
+  geom_label( # draw leafs: predicted outcome
+    data = leaf_label(data), 
+    aes(x = x, y = y, label = label,), fill = "yellowgreen"
+    ) +
+  theme_dendro() +
+  ggtitle("rpart tree (training set)")
+
+rm(fit)
+```
+
+#### rf
+
+Rf stands for random forest. Like its name, random forest produces not just one
+tree, but hundreds. The predicted $\hat y$ will be account for predictions from
+all trees. Unlike rpart, rf *randomly* chooses predictors to split. The number
+of predictors $mtry$ is a tuning parameter, and for regression rf suggests
+$mtry = \sqrt{npredictors} = \sqrt{4} = 2$. So we will plug in $mtry = 2$ and
+won't tune.
+
+The rmse is better than rpart because rf has more decision trees.
+
+```{r rf}
+set.seed(1)
+fit <- train(
+  x = train_set$x,
+  y = train_set$y,
+  method = "rf",
+  tuneGrid = data.frame(mtry = 2)
+)
+
+set.seed(1)
+nonlinear_models <- nonlinear_models %>% mutate(
+  rf = predict(fit, test_set$x)
+  )
+
+rmses_nonlinear <- rmses_nonlinear %>% add_row(
+  method = "rf",
+  rmse = RMSE(nonlinear_models$rf, test_set$y)
+  )
+rmses_nonlinear
+
+rm(fit)
+```
+
+#### Ensemble
+
+We use the same approach to create ensemble, taking the mean of rpart and rf
+predictions. The ensemble's rmse is not ranked the top, but since it's only a
+bit worse than rf, we will choose the ensemble as final model. Maybe with a
+different train-test split the ranks would change, so using ensemble is safer.
+
+```{r nonlinear-ensemble}
+# Create non-linear ensemble by taking the mean of rf and rpart
+nonlinear_models <- nonlinear_models %>%
+  rowwise() %>%
+  mutate(ensemble = mean(c(rf, rpart))) %>%
+  ungroup()
+
+rmses_nonlinear <- rmses_nonlinear %>% add_row(
+  method = "ensemble",
+  rmse = RMSE(nonlinear_models$ensemble, test_set$y)
+)
+
+# arrange models from low to high rmse
+rmses_nonlinear <- rmses_nonlinear %>% arrange(rmse)
+rmses_nonlinear
+```
+
+Looking at the plot, all three methods have super dense region centered on the
+line. The residuals are usually within 10 years, and grow larger (20, 30 years)
+as true max-longevity increases.
+
+```{r nonlinear-plot}
+nonlinear_models %>%
+  transmute(
+    true = test_set$y,
+    r_rf = true - rf,
+    r_rpart = true - rpart,
+    r_ensemble = true - ensemble
+  ) %>%
+  pivot_longer(
+    cols = -true,
+    names_to = "method",
+    names_pattern = "r_(.*)",
+    values_to = "residual"
+    ) %>%
+  mutate(method = factor(
+    method,
+    levels = rmses_nonlinear$method, 
+    ordered = TRUE
+    )) %>%
+  ggplot(aes(true, residual)) +
+  geom_density_2d_filled(contour_var = "ndensity") +
+  geom_hline(yintercept = 0, size = 1, alpha = 0.75, color = "white") +
+  geom_point(color = "white", alpha = 0.25) +
+  scale_x_log10() +
+  annotation_logticks(sides = "b") +
+  theme_dark() +
+  ggtitle("Non-linear models residuals") +
+  facet_wrap(method~.)
+```
+
+Similar to linear ensemble, non-linear ensemble's top mistakes are
+underestimates (since $r > 0$), but the mistakes are larger compared to linear.
+
+```{r nonlinear-mistakes}
+test_set %>%
+  mutate(
+    residual = y - nonlinear_models$ensemble
+  ) %>%
+  select(Class, `Common name`, y, residual) %>%
+  slice_max(order_by = abs(residual), n = 3)
+
+rm(nonlinear_models, rmses_nonlinear)
+```
+
+### Grouping vs. individual {#group-indiv}
+
+Non-linear's partitioning means that all species in the same group get the same
+estimate (tree's leaf node), but for outliers like Killer whale, their lifespans
+might be too short/long to fit with the group, which then contribute to large
+residuals. On the other hand, even though linear also made mistake on Killer
+whale, the residual is lower because the linear equation gives the species its
+own estimate.
+
+## Final 2 models {#final-models}
+
+Now it's time to create the final 2 ensemble models, linear and non-linear.
+
+1.  **tune**: No more tuning! Previously we already tuned and stored best tuning
+    combo, so this time we just plug it in.
+2.  **train**: Using *all available data* we can get which is training set +
+    test set together, because more data is better.
+3.  **predict**: On validation set, which will give us final 2 rmses.
+
+To save space, I've put all linear equations of lm and cubist, and decision tree
+plot of rpart in appendix [methods details](#methods-details) section. It's
+quite interesting to see that with more training data, the tree and equations
+are different now. *Be sure to check those out!*
+
+```{r final-linear, include=FALSE}
+# form the available set by putting train + test together
+available_set <- rbind(train_set, test_set)
+rm(train_set, test_set)
+
+set.seed(1)
+fit <- train(
+  x = available_set$x,
+  y = available_set$y,
+  method = "cubist",
+  tuneGrid = best_tunes$cubist # use the stored best tuning combo
+)
+
+set.seed(1)
+final_models <- tibble(cubist = predict(fit, validation_set$x))
+
+cubist <- fit$finalModel
+save(cubist, file = "cubist.rda") # save linear models details for appendix
+rm(fit, cubist)
+
+set.seed(1)
+fit <- train(
+  x = available_set$x,
+  y = available_set$y,
+  method = "lm"
+)
+
+set.seed(1)
+final_models <- final_models %>% mutate(
+  lm = predict(fit, validation_set$x)
+)
+
+lm <- fit$finalModel$coefficients
+save(lm, file = "lm.rda") # save coefficients of linear eq for appendix
+rm(fit, lm)
+
+final_models <- final_models %>%
+  rowwise() %>%
+  mutate(linear = mean(c(lm, cubist))) %>%
+  ungroup() %>%
+  select(-c(lm, cubist))
+```
+
+```{r final-nonlinear, include=FALSE}
+set.seed(1)
+fit <- train(
+  x = available_set$x,
+  y = available_set$y,
+  method = "rpart",
+  tuneGrid = best_tunes$rpart
+)
+
+set.seed(1)
+final_models <- final_models %>% mutate(
+  rpart = predict(fit, validation_set$x)
+)
+
+rpart <- fit$finalModel
+save(rpart, file = "rpart.rda") # save to plot decision tree for appendix
+rm(fit, rpart)
+
+set.seed(1)
+fit <- train(
+  x = available_set$x,
+  y = available_set$y,
+  method = "rf",
+  tuneGrid = data.frame(mtry = 2)
+)
+
+set.seed(1)
+final_models <- final_models %>% mutate(
+  rf = predict(fit, validation_set$x)
+)
+
+rm(fit)
+
+# form the non-linear ensemble
+final_models <- final_models %>%
+  rowwise() %>%
+  mutate(nonlinear = mean(c(rpart, rf))) %>%
+  ungroup() %>%
+  select(-c(rpart, rf))
+
+rm(best_tunes, available_set)
+
+# we won't need parallel computing anymore now that we're done
+stopCluster(cl)
+rm(cl)
+```
+
+# Results
+
+```{r final-rmse}
+rmses_final <- tibble(
+  method = c("linear", "nonlinear"), 
+  rmse = c(
+    RMSE(final_models$linear, validation_set$y),
+    RMSE(final_models$nonlinear, validation_set$y)
+  ))
+
+# rank methods based on rmse from low to high
+rmses_final <- rmses_final %>% arrange(rmse)
+rmses_final
+```
+
+Linear and non-linear perform almost equally well, with linear taking a lead of
+about 0.5 years better than non-linear. Linear ensemble achieved a rmse of
+`r rmses_final[1]$rmse` years and non-linear ensemble achieved a rmse of
+`r rmses_final[2]$rmse` years.
+
+The 5-number summary and boxplot below shows the distributions of true outcome
+$y$, linear $\hat y$ and non-linear $\hat y$. Both ensembles' lowest predictions
+start around 7 years, which is 5 years higher than true outcome of 2.5. The
+highest predictions end around 80 years, but true outcome has outliers up to 120
+years. However, both ensembles did excellently between Q1 and Q3, which is 50%
+of our data.
+
+```{r final-boxplot}
+# 5-number summaries for true outcomes y, linear y_hat, and non-linear y_hat
+summary_outcome <- sapply(
+  c(validation_set %>% transmute(true = y), final_models),# rename y to true
+  function(o) summary(o))
+# formatting
+as_tibble(t(summary_outcome), rownames = "Source")
+rm(summary_outcome)
+
+# Boxplot of final ensembles models pred vs. true max-longevity
+# From left to right, want methods subplots arranged from low to high rmse
+# true outcomes are not predictions, but still put it on the left since 0 error
+final_models %>%
+  # add true outcomes to our dataframe
+  mutate(
+    true = validation_set$y
+  ) %>%
+  pivot_longer( # create 2 columns, source and max-longevity, spread the data
+    cols = everything(),
+    names_to = "source",
+    values_to = "max_longevity"
+    ) %>%
+  mutate(source = factor(
+    source, # since true is not inside rmses_final$method, add it to the factor
+    levels = c("true", rmses_final$method), 
+    ordered = TRUE
+    )) %>%
+  ggplot(aes(source, max_longevity, fill = source)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Pastel1") +
+  guides(fill = "none") +
+  ggtitle("Final ensemble models pred vs. true max-longevity")
+```
+
+The two methods residuals smooth lines are very close to each other. For birds,
+non-linear ensemble gives a slightly better prediction. For mammals, linear
+ensemble gives better predictions to long lifespan outliers compared to
+non-linear.
+
+Non-linear models partitions species into groups, and assign a $\hat y$ for the
+group. If an outlier is too different compared to its group members, it will
+have a large residual. Since linear models uses equations, outliers get their
+individual $\hat y$ which hopefully would be a better fit. (The reasoning is
+also discussed previously in [grouping vs. individual](#group-indiv) section.)
+
+```{r final-residual}
+# Residuals plot facet by class and colored by method
+# Want to compare how models did for birds vs. mammals
+# Want to compare linear vs. non-linear ensemble
+validation_set %>%
+  mutate(
+    true = y,
+    r_linear = true - final_models$linear,
+    r_nonlinear = true - final_models$nonlinear
+  ) %>%
+  select(Class, true, r_linear, r_nonlinear) %>%
+  pivot_longer(
+    cols = c(r_linear, r_nonlinear),
+    names_to = "method",
+    names_pattern = "r_(.*)",
+    values_to = "residual"
+    ) %>%
+  mutate(method = factor(
+    method,
+    levels = rmses_final$method, 
+    ordered = TRUE
+    )) %>%
+  ggplot(aes(true, residual, color = method)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(aes(color = method), se = FALSE) +
+  geom_hline(yintercept = 0, size = 1, alpha = 0.75) +
+  scale_x_log10() +
+  annotation_logticks(sides = "b") +
+  scale_color_brewer(palette = "Pastel1") +
+  theme_dark() +
+  ggtitle("Final ensemble models residuals by class") +
+  facet_wrap(Class~.)
+```
+
+Let's see the top 5 mistakes made by two ensembles. Interestingly linear
+ensemble predicts human to live a max around 80 years, while non-linear predicts
+only 50 years. If we ignore human, non-linear ensemble's top mistakes are
+actually better than linear's. We see positive residual more frequently than
+negative, which means both models top mistakes are often underestimating
+max-longevity.
+
+```{r final-mistakes}
+# Top 5 mistakes made by linear ensemble
+validation_set %>%
+  mutate(
+    linear = final_models$linear,
+    residual = y - linear
+  ) %>%
+  select(Class, `Common name`, y, linear, residual) %>%
+  slice_max(order_by = abs(residual), n = 5)
+
+# Top 5 mistakes made by non-linear ensemble
+validation_set %>%
+  mutate(
+    nonlinear = final_models$nonlinear,
+    residual = y - nonlinear
+  ) %>%
+  select(Class, `Common name`, y, nonlinear, residual) %>%
+  slice_max(order_by = abs(residual), n = 5)
+```
+
+```{r cleanup, include=FALSE}
+rm(final_models, rmses_final, validation_set)
+```
+
+# Conclusion
+
+In this project we solved the regression problem of predicting animals
+max-longevity. The solution was to create 2 ensemble models, 1 linear and 1
+non-linear, which are robust and proved to work very well. We dived deep into
+caret's predictor selection, tuning, training, and predicting process. We
+combined 2 linear methods cubist and lm to create the linear ensemble, and 2
+non-linear methods rpart and rf to create the non-linear ensemble. We explored
+how linear and non-linear methods work with equations and decision trees, and
+compared their performance by looking at residual plots and top mistakes made.
+
+**Potential impact**: With a good machine learning model, scientists only need a
+few animal attributes in order to predict max-longevity, and don't need to wait
+decades to find out. Even for scientists who don't code, the models provide
+linear equations and decision trees which are easy to interpret.
+
+**Limitations**: As we have discussed extensively before, outliers are
+contributing to residuals and we need ways to make sure the fit is good. Perhaps
+with more data on species like the outliers we would be able to predict better.
+We only predicted birds and mammals because there are enough of them with no
+NAs. Even though our predictor matrix have no NAs, a few methods on caret can
+actually take a matrix with NAs. So we could use those methods to predict other
+classes with many NAs like amphibians, fish, reptiles, etc.
+
+**Future work**: I only used numerical predictors for predicting max-longevity
+and didn't use animal's class (bird, mammal) which has the type factor. As we
+have seen in the results residuals plot, linear models predicts mammals better,
+and non-linear models predicts birds better. Maybe each animal class needs a
+different ensemble, so the algorithm to predict animal max-longevity from many
+classes would be a mega ensemble.
+
+# Appendix
+
+When you are done, click the *jump back* link at the beginning/end to take you
+back!
+
+## Original dataset {#original-dataset}
+
+*Jump back to [data cleaning](#data-cleaning)*
+
+There are 31 variables in the original dataset. First I'll describe what each
+variable means, then I'll show the summary code output.
+
+**biology taxonomy variables**
+
+| Var     | Example  | Var         | Example   |
+|---------|----------|-------------|-----------|
+| Kingdom | Animalia | Family      | Hominidae |
+| Phylum  | Chordata | Genus       | Homo      |
+| Class   | Mammalia | Species     | sapiens   |
+| Order   | Primates | Common name | Human     |
+
+**life history variables**
+
++------------------------------+-----------------------------------------------+
+| Var                          | Desc                                          |
++==============================+===============================================+
+| Maximum longevity (yrs)      | the maximum recorded years this species are   |
+|                              | recorded to live                              |
++------------------------------+-----------------------------------------------+
+| Female maturity (days), Male | female/male age of sexual maturity            |
+| maturity (days)              |                                               |
++------------------------------+-----------------------------------------------+
+| Gestation/Incubation (days)  | pregnancy time: mammals gestate litters,      |
+|                              | birds incubate eggs                           |
++------------------------------+-----------------------------------------------+
+| Weaning (days)               | *mammals only*: gradually introduce infant to |
+|                              | adult diet, fully weaned means no more milk   |
++------------------------------+-----------------------------------------------+
+| Litter/Clutch size           | number of young: litters or eggs              |
++------------------------------+-----------------------------------------------+
+| Litters/Clutches per year,   | litters per year = number of litters /        |
+| Inter-litter/Interbirth      | inter-litter interval                         |
+| interval                     |                                               |
++------------------------------+-----------------------------------------------+
+| Birth weight (g), Weaning    | weight at birth, weaning, adult stage in      |
+| weight (g), Adult weight (g) | grams                                         |
++------------------------------+-----------------------------------------------+
+| Growth rate (1/days)         | postnatal growth rate                         |
++------------------------------+-----------------------------------------------+
+| IMR (per yr)                 | infant mortality rate                         |
++------------------------------+-----------------------------------------------+
+| MRDT (yrs)                   | mortality rate doubling time                  |
++------------------------------+-----------------------------------------------+
+| Metabolic rate (W)           | rate of metabolism in watts                   |
++------------------------------+-----------------------------------------------+
+| Body mass (g)                | body mass in grams                            |
++------------------------------+-----------------------------------------------+
+| Temperature (k)              | temperature in kelvin                         |
++------------------------------+-----------------------------------------------+
+
+**quality variables**
+
++----------------+-------------------------------------------------------------+
+| Var            | Desc                                                        |
++================+=============================================================+
+| Specimen       | captivity, wild, or unknown                                 |
+| origin         |                                                             |
++----------------+-------------------------------------------------------------+
+| Sample size    | tiny ($<$ 10), small (10 to 1000), medium ($>$ 1000), or    |
+|                | huge (only humans has huge sample size)                     |
++----------------+-------------------------------------------------------------+
+| Data quality   | confidence in longevity data: low, questionable,            |
+|                | acceptable, or high                                         |
++----------------+-------------------------------------------------------------+
+
+**reference variables**
+
+| Var        | Desc                                                   |
+|------------|--------------------------------------------------------|
+| HAGRID     | id of the record                                       |
+| Source     | id of the source that can verify record's authenticity |
+| References | id of all references for this record                   |
+
+This summary contains 5-number summary for all numeric variables, as well as
+number of NAs. Variables with many NAs are not used.
+
+```{r summary_age, echo=FALSE}
+load("summary_age.rda")
+summary_age
+
+rm(summary_age)
+unlink("summary_age.rda")
+```
+
+*Jump back to [data cleaning](#data-cleaning)*
+
+## Methods details {#methods-details}
+
+*Jump back to [final models](#final-models)*
+
+Here are the linear equations of lm and cubist, and the decision tree from
+rpart. There is no tree visualization for random forest because there could be
+hundreds of trees. I used all data that is available (train + test sets) to
+train the final methods.
+
+### lm
+
+```{r summary-lm}
+# final lm coefficients
+load("lm.rda")
+lm
+
+rm(lm)
+unlink("lm.rda")
+```
+
+### rpart
+
+```{r summary-rpart}
+# final rpart decision tree
+load("rpart.rda")
+data <- dendro_data(rpart)
+data$labels$label <- str_replace_all(data$labels$label, "Fem.*\\)", "mat ")
+data$labels$label <- str_replace_all(data$labels$label, "Adult.*\\)", "wt ")
+data$labels$label <- str_replace_all(data$labels$label, "Ges.*\\)", "ges ")
+data$labels$label <- str_replace_all(data$labels$label, "Lit.*\\)", "lit ")
+data$leaf_labels$label <- as.numeric(data$leaf_labels$label)
+
+ggplot() + 
+  geom_segment(
+    data = segment(data), 
+    aes(x = x, y = y, xend = xend, yend = yend), alpha = 0.5
+    ) +
+  geom_label(
+    data = label(data), 
+    aes(x = x, y = y, label = label), fill = "lightskyblue"
+    ) +
+  geom_label(
+    data = leaf_label(data), 
+    aes(x = x, y = y, label = label,), fill = "yellowgreen"
+    ) +
+  theme_dendro() +
+  ggtitle("rpart tree (final)")
+
+rm(rpart, data)
+unlink("rpart.rda")
+```
+
+### cubist
+
+```{r summary-cubist}
+# final cubist linear models equations
+load("cubist.rda")
+summary(cubist)
+
+rm(cubist)
+unlink("cubist.rda")
+```
+
+*Jump back to [final models](#final-models)*
+
+# References
+
+## Dataset
+
+Tacutu, R., Craig, T., Budovsky, A., Wuttke, D., Lehmann, G., Taranukha, D.,
+Costa, J., Fraifeld, V. E., de Magalhaes, J. P. (2013) "Human Ageing Genomic
+Resources: Integrated databases and tools for the biology and genetics of
+ageing." *Nucleic Acids Research* **41**(D1):D1027-D1033.
+[PubMed](http://www.ncbi.nlm.nih.gov/entrez/query.fcgi?cmd=Retrieve&db=PubMed&list_uids=23193293&dopt=Abstract)
+
+-   The dataset is under *Downloading AnAge* section in AnAge home page.
+-   AnAge home page:
+    [\<https://genomics.senescence.info/species/index.html>](https://genomics.senescence.info/species/index.html){.uri}
+-   Dataset (zipped tab-delimited):
+    [\<https://genomics.senescence.info/species/dataset.zip>](https://genomics.senescence.info/species/dataset.zip){.uri}
+
+## Libraries
+
+### caret
+
+Kuhn, M. (2008), "Building predictive models in R using the caret package, "
+*Journal of Statistical Software*, (doi: 10.18637/jss.v028.i05).
+
+-   Book: <https://topepo.github.io/caret/>
+-   CRAN Short introduction:
+    <https://cran.r-project.org/web/packages/caret/vignettes/caret.html>
+
+### cubist
+
+Kuhn M, Quinlan R (2022). *Cubist: Rule- And Instance-Based Regression
+Modeling*. <https://topepo.github.io/Cubist//,>
+<https://topepo.github.io/Cubist/.>
+
+-   CRAN Short introduction:
+    <https://cran.r-project.org/web/packages/Cubist/vignettes/cubist.html>
+
+### rpart
+
+Terry Therneau and Beth Atkinson (2022). rpart: Recursive Partitioning and
+Regression Trees. R package version 4.1.16.
+<https://CRAN.R-project.org/package=rpart>
+
+-   CRAN: <https://cran.r-project.org/web/packages/rpart/index.html>
+
+### random forest
+
+Liaw A, Wiener M (2002). "Classification and Regression by randomForest." *R
+News*, **2**(3), 18-22.
+[\<https://CRAN.R-project.org/doc/Rnews/>](https://cran.r-project.org/doc/Rnews/).
+
+-   CRAN: <https://cran.r-project.org/web/packages/randomForest/index.html>
+
+### more citations
+
+Andrie de Vries and Brian D. Ripley (2022). ggdendro: Create Dendrograms and
+Tree Diagrams Using 'ggplot2'. R package version 0.1.23.
+<https://CRAN.R-project.org/package=ggdendro>
+
+Microsoft Corporation and Steve Weston (2022). doParallel: Foreach Parallel
+Adaptor for the 'parallel' Package. R package version 1.0.17.
+<https://CRAN.R-project.org/package=doParallel>
+
+Taiyun Wei and Viliam Simko (2021). R package 'corrplot': Visualization of a
+Correlation Matrix (Version 0.92). Available from
+<https://github.com/taiyun/corrplot>
+
+Victor Perrier and Fanny Meyer (2021). gfonts: Offline 'Google' Fonts for
+'Markdown' and 'Shiny'. R package version 0.1.3.
+<https://CRAN.R-project.org/package=gfonts>
+
+Wickham et al., (2019). Welcome to the tidyverse. Journal of Open Source
+Software, 4(43), 1686, <https://doi.org/10.21105/joss.01686>
+
+Yihui Xie and J.J. Allaire and Garrett Grolemund (2018). R Markdown: The
+Definitive Guide. Chapman and Hall/CRC. ISBN 9781138359338. URL
+<https://bookdown.org/yihui/rmarkdown.>
+
+Yihui Xie (2021). knitr: A General-Purpose Package for Dynamic Report Generation
+in R. R package version 1.37.
